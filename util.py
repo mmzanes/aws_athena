@@ -1,10 +1,24 @@
 from dotenv import dotenv_values
 import boto3
-import pandas
+import pandas as pd
 import csv
+import time
+import progressbar
 env = dotenv_values('.env')
 
 class S3:
+    def client_s3():
+        try:
+            return boto3.client(
+        service_name=env.get('SERVICE_NAME'),
+        region_name=env.get('REGION_NAME'),
+        aws_access_key_id=env.get('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=env.get('AWS_SECRET_ACCESS_KEY')
+        )
+        except Exception as e:
+            print('Cannot connect to S3 due to:' + str(e))
+            return None
+
     def connect_s3():
         try:
             return boto3.resource(
@@ -46,12 +60,25 @@ class S3:
         finally:
             print('All objects have been listed')
 
-class Athena:
-    def s3_cleanup(bucket_name):
+    def download_file_s3(bucket_name, file_name):
         s3 = S3.connect_s3()
-        bucket = s3.Bucket(bucket_name)
-        for obj in bucket.objects.filter(Prefix='Query-Results/'):
-            s3.Object(bucket_name,obj.key).delete()
+        s3_client = S3.client_s3()
+        size = s3_client.head_object(Bucket=bucket_name, Key='output/' + file_name).get('ContentLength')
+        print('Starting download:')
+        progress = progressbar.progressbar.ProgressBar(maxval=size)
+        progress.start()
+        def download_progress(chunk):
+            progress.update(progress.currval + chunk)
+
+        s3.Bucket(bucket_name).download_file('output/' + file_name, 'downloads/' + file_name, Callback=download_progress)
+        progress.finish()
+
+class Athena:
+    # def s3_cleanup(bucket_name):
+    #     s3 = S3.connect_s3()
+    #     bucket = s3.Bucket(bucket_name)
+    #     for obj in bucket.objects.filter(Prefix='Query-Results/'):
+    #         s3.Object(bucket_name,obj.key).delete()
 
     def query_results(session, params, wait = True):
         client = session.client('athena')
@@ -60,6 +87,7 @@ class Athena:
             return [obj.get('VarCharValue') for obj in d['Data']]
 
         response_query_execution_id = client.start_query_execution(
+            WorkGroup="primary",
             QueryString = params['query'],
             QueryExecutionContext = {
                 'Database' : "default"
@@ -83,9 +111,11 @@ class Athena:
                 QueryExecutionId = response_query_execution_id['QueryExecutionId']
                 )
                 status = response_get_query_details['QueryExecution']['Status']['State']
+                total_execution = response_get_query_details['QueryExecution']['Statistics']['TotalExecutionTimeInMillis']
+                print('Athena execution time: ' + str(total_execution) + 'ms', end='\r')
 
                 if (status == 'FAILED') or (status == 'CANCELLED') :
-                    return False, False
+                    return 'False', 'False'
 
                 elif status == 'SUCCEEDED':
                     location = response_get_query_details['QueryExecution']['ResultConfiguration']['OutputLocation']
@@ -97,14 +127,12 @@ class Athena:
 
                     if len(response_query_result['ResultSet']['Rows']) > 1:
                         header = response_query_result['ResultSet']['Rows'][0]
-                        rows = response_query_result['ResultSet']['Rows'][1:]
 
                         header = [obj['VarCharValue'] for obj in header['Data']]
-                        result = [dict(zip(header, get_var_char_values(row))) for row in rows]
                         delta = response_get_query_details.get('QueryExecution',{}).get('Statistics',{}).get('TotalExecutionTimeInMillis')
-                        return location, result, delta
+                        return location, delta
                     else:
-                        return location, None, 0
+                        return location, 0
             else:
                     time.sleep(5)
 
@@ -119,10 +147,9 @@ class Athena:
     }
         params['query'] = query
         session = boto3.Session()
-        location, data, delta = Athena.query_results(session, params)
-        print('Locations: ',location)
-        print('Execution Time(ms): ' + str(delta))
-        print('Result Data(First {}): '.format(limit))
-        for d in data[0:limit]:
-            print(d)
+        location, delta = Athena.query_results(session, params)
+        print('Athena execution time: ' + str(delta) + 'ms')
+        print('Location: ',location)
+
+        return location, delta
         # Athena.s3_cleanup(env.get('bucket'))
